@@ -408,16 +408,19 @@ gboolean
 fu_plugin_update_attach (FuPlugin *plugin, FuDevice *device, GError **error)
 {
 	g_autoptr(FuDeviceLocker) locker = NULL;
+        gboolean result;
 
 	/* open device */
 	locker = fu_device_locker_new (device, error);
 	if (locker == NULL)
 		return FALSE;
 
+	/* reset */
+	result = fu_device_attach (FU_DEVICE (device), error);
+
 	/* must be done in idle so that the engine explicitly
 	 * waits for the device to be redetected */
 	g_idle_add (fu_plugin_mm_uninhibit_device_idle, plugin);
 
-	/* reset */
-	return fu_device_attach (FU_DEVICE (device), error);
+	return result;
 }

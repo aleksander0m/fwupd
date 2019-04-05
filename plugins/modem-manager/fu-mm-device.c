@@ -48,6 +48,7 @@ struct _FuMmDevice {
 	/* qmi-pdc update logic */
 	gchar				*port_qmi;
 	FuQmiPdcUpdater			*qmi_pdc_updater;
+	GArray				*qmi_pdc_active_id;
 };
 
 G_DEFINE_TYPE (FuMmDevice, fu_mm_device, FU_TYPE_DEVICE)
@@ -426,13 +427,16 @@ fu_mm_device_detach (FuDevice *device, GError **error)
 }
 
 typedef struct {
-	gchar  *filename;
-	GBytes *bytes;
+	gchar		*filename;
+	GBytes		*bytes;
+	GArray		*digest;
+	gboolean	 active;
 } FuMmFileInfo;
 
 static void
 fu_mm_file_info_free (FuMmFileInfo *file_info)
 {
+	g_clear_pointer (&file_info->digest, g_array_unref);
 	g_free (file_info->filename);
 	g_bytes_unref (file_info->bytes);
 	g_free (file_info);
@@ -445,6 +449,34 @@ typedef struct {
 	gsize		 total_written;
 	gsize		 total_bytes;
 } FuMmArchiveIterateCtx;
+
+static gboolean
+should_be_active (const gchar *version,
+		  const gchar *filename)
+{
+	g_auto(GStrv) split = NULL;
+	g_autofree gchar *carrier_id = NULL;
+
+	/* The filename of the mcfg file is composed of a "mcfg." prefix, then the
+	 * carrier code, followed by the carrier version, and finally a ".mbn"
+	 * prefix. Here we try to guess, based on the carrier code, whether the
+	 * specific mcfg file should be activated after the firmware upgrade
+	 * operation.
+	 *
+	 * This logic requires that the previous device version includes the carrier
+	 * code also embedded in the version string. E.g. "xxxx.VF.xxxx". If we find
+	 * this match, we assume this is the active config to use.
+	 */
+
+	split = g_strsplit (filename, ".", -1);
+	if (g_strv_length (split) < 4)
+		return FALSE;
+	if (g_strcmp0 (split[0], "mcfg") != 0)
+		return FALSE;
+
+	carrier_id = g_strdup_printf (".%s.", split[1]);
+	return (g_strstr_len (version, -1, carrier_id) != NULL);
+}
 
 static void
 fu_mm_qmi_pdc_archive_iterate_mcfg (FuArchive	*archive,
@@ -462,6 +494,7 @@ fu_mm_qmi_pdc_archive_iterate_mcfg (FuArchive	*archive,
 	file_info = g_new0 (FuMmFileInfo, 1);
 	file_info->filename = g_strdup (filename);
 	file_info->bytes = g_bytes_ref (bytes);
+        file_info->active = should_be_active (fu_device_get_version (FU_DEVICE (ctx->device)), filename);
 	g_ptr_array_add (ctx->file_infos, file_info);
 	ctx->total_bytes += g_bytes_get_size (file_info->bytes);
 }
@@ -483,11 +516,22 @@ fu_mm_device_qmi_close (FuMmDevice *self, GError **error)
 }
 
 static gboolean
-fu_mm_device_write_firmware_qmi_pdc (FuDevice *device, GBytes *fw, GError **error)
+fu_mm_device_qmi_close_no_error (FuMmDevice *self, GError **error)
+{
+	g_autoptr(FuQmiPdcUpdater) updater = NULL;
+
+	updater = g_steal_pointer (&self->qmi_pdc_updater);
+	fu_qmi_pdc_updater_close (updater, NULL);
+        return TRUE;
+}
+
+static gboolean
+fu_mm_device_write_firmware_qmi_pdc (FuDevice *device, GBytes *fw, GArray **active_id, GError **error)
 {
 	g_autoptr(FuArchive) archive = NULL;
 	g_autoptr(FuDeviceLocker) locker = NULL;
 	g_autoptr(GPtrArray) file_infos = g_ptr_array_new_with_free_func ((GDestroyNotify)fu_mm_file_info_free);
+        gint active_i = -1;
 	FuMmArchiveIterateCtx archive_context = {
 		.device = FU_MM_DEVICE (device),
 		.error = NULL,
@@ -514,15 +558,27 @@ fu_mm_device_write_firmware_qmi_pdc (FuDevice *device, GBytes *fw, GError **erro
 
 	for (guint i = 0; i < file_infos->len; i++) {
 		FuMmFileInfo *file_info = g_ptr_array_index (file_infos, i);
-		if (!fu_qmi_pdc_updater_write (archive_context.device->qmi_pdc_updater,
-					       file_info->filename,
-					       file_info->bytes,
-					       &archive_context.error)) {
+                file_info->digest = fu_qmi_pdc_updater_write (archive_context.device->qmi_pdc_updater,
+                                                              file_info->filename,
+                                                              file_info->bytes,
+                                                              &archive_context.error);
+                if (file_info->digest == NULL) {
 			g_prefix_error (&archive_context.error,
 					"Failed to write file '%s':", file_info->filename);
 			break;
 		}
+                /* if we wrongly detect more than one, just assume the latest one; this
+                 * is not critical, it may just take a bit more time to perform the
+                 * automatic carrier config switching in ModemManager */
+                if (file_info->active)
+                	active_i = i;
 	}
+
+        /* set expected active configuration */
+        if (active_i >= 0 && active_id != NULL) {
+		FuMmFileInfo *file_info = g_ptr_array_index (file_infos, active_i);
+                *active_id = g_array_ref (file_info->digest);
+        }
 
 	if (archive_context.error != NULL) {
 		g_propagate_error (error, archive_context.error);
@@ -547,7 +603,7 @@ fu_mm_device_write_firmware (FuDevice *device, GBytes *fw, GError **error)
 
 	/* qmi pdc write operation */
 	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_QMI_PDC)
-		return fu_mm_device_write_firmware_qmi_pdc (device, fw, error);
+		return fu_mm_device_write_firmware_qmi_pdc (device, fw, &self->qmi_pdc_active_id, error);
 
 	g_set_error (error, FWUPD_ERROR, FWUPD_ERROR_NOT_SUPPORTED,
 		     "unsupported update method");
@@ -555,14 +611,44 @@ fu_mm_device_write_firmware (FuDevice *device, GBytes *fw, GError **error)
 }
 
 static gboolean
+fu_mm_device_attach_qmi_pdc (FuDevice *device, GArray *active_id, GError **error)
+{
+	FuMmDevice *self = FU_MM_DEVICE (device);
+	g_autoptr(FuDeviceLocker) locker = NULL;
+
+        /* ignore action if there is no active id specified */
+        if (active_id == NULL)
+                return TRUE;
+
+        /* errors closing may be expected if the device really reboots itself */
+	locker = fu_device_locker_new_full (device,
+					    (FuDeviceLockerFunc) fu_mm_device_qmi_open,
+					    (FuDeviceLockerFunc) fu_mm_device_qmi_close_no_error,
+					    error);
+	if (locker == NULL)
+		return FALSE;
+
+        if (!fu_qmi_pdc_updater_activate (self->qmi_pdc_updater, active_id, error))
+                return FALSE;
+
+	return TRUE;
+}
+
+static gboolean
 fu_mm_device_attach (FuDevice *device, GError **error)
 {
+	FuMmDevice *self = FU_MM_DEVICE (device);
 	g_autoptr(FuDeviceLocker) locker  = NULL;
 
 	/* lock device */
 	locker = fu_device_locker_new (device, error);
 	if (locker == NULL)
 		return FALSE;
+
+	/* qmi pdc attach may involve selecting a new active config */
+	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_QMI_PDC &&
+            !fu_mm_device_attach_qmi_pdc (device, self->qmi_pdc_active_id, error))
+        	return FALSE;
 
 	/* wait for re-probing after uninhibiting */
 	fu_device_set_remove_delay (device, FU_MM_DEVICE_REMOVE_DELAY_REPROBE);
@@ -583,6 +669,7 @@ static void
 fu_mm_device_finalize (GObject *object)
 {
 	FuMmDevice *self = FU_MM_DEVICE (object);
+        g_clear_pointer (&self->qmi_pdc_active_id, g_array_unref);
 	g_object_unref (self->manager);
 	if (self->omodem != NULL)
 		g_object_unref (self->omodem);
