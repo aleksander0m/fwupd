@@ -49,7 +49,15 @@ struct _FuMmDevice {
 	gchar				*port_qmi;
 	FuQmiPdcUpdater			*qmi_pdc_updater;
 	GArray				*qmi_pdc_active_id;
+	guint				 attach_idle;
 };
+
+enum {
+	SIGNAL_ATTACH_FINISHED,
+	SIGNAL_LAST
+};
+
+static guint signals [SIGNAL_LAST] = { 0 };
 
 G_DEFINE_TYPE (FuMmDevice, fu_mm_device, FU_TYPE_DEVICE)
 
@@ -611,27 +619,51 @@ fu_mm_device_write_firmware (FuDevice *device, GBytes *fw, GError **error)
 }
 
 static gboolean
-fu_mm_device_attach_qmi_pdc (FuDevice *device, GArray *active_id, GError **error)
+fu_mm_device_attach_qmi_pdc (FuMmDevice *self, GError **error)
 {
-	FuMmDevice *self = FU_MM_DEVICE (device);
 	g_autoptr(FuDeviceLocker) locker = NULL;
 
         /* ignore action if there is no active id specified */
-        if (active_id == NULL)
+        if (self->qmi_pdc_active_id == NULL)
                 return TRUE;
 
         /* errors closing may be expected if the device really reboots itself */
-	locker = fu_device_locker_new_full (device,
+	locker = fu_device_locker_new_full (self,
 					    (FuDeviceLockerFunc) fu_mm_device_qmi_open,
 					    (FuDeviceLockerFunc) fu_mm_device_qmi_close_no_error,
 					    error);
 	if (locker == NULL)
 		return FALSE;
 
-        if (!fu_qmi_pdc_updater_activate (self->qmi_pdc_updater, active_id, error))
+        if (!fu_qmi_pdc_updater_activate (self->qmi_pdc_updater, self->qmi_pdc_active_id, error))
                 return FALSE;
 
 	return TRUE;
+}
+
+static gboolean
+fu_mm_device_attach_noop_idle (gpointer user_data)
+{
+        FuMmDevice *self = FU_MM_DEVICE (user_data);
+        self->attach_idle = 0;
+        g_signal_emit (self, signals [SIGNAL_ATTACH_FINISHED], 0);
+        return G_SOURCE_REMOVE;
+}
+
+static gboolean
+fu_mm_device_attach_qmi_pdc_idle (gpointer user_data)
+{
+        FuMmDevice *self = FU_MM_DEVICE (user_data);
+        g_autoptr(GError) error = NULL;
+
+        if (!fu_mm_device_attach_qmi_pdc (self, &error))
+                g_warning ("qmi-pdc attach operation failed: %s", error->message);
+        else
+                g_debug ("qmi-pdc attach operation successful");
+
+        self->attach_idle = 0;
+        g_signal_emit (self, signals [SIGNAL_ATTACH_FINISHED], 0);
+        return G_SOURCE_REMOVE;
 }
 
 static gboolean
@@ -645,10 +677,12 @@ fu_mm_device_attach (FuDevice *device, GError **error)
 	if (locker == NULL)
 		return FALSE;
 
-	/* qmi pdc attach may involve selecting a new active config */
-	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_QMI_PDC &&
-            !fu_mm_device_attach_qmi_pdc (device, self->qmi_pdc_active_id, error))
-        	return FALSE;
+	/* we want this attach operation to be triggered asynchronously, because the engine
+         * must learn that it has to wait for replug before we actually trigger the reset. */
+	if (self->update_methods & MM_MODEM_FIRMWARE_UPDATE_METHOD_QMI_PDC)
+                self->attach_idle = g_idle_add ((GSourceFunc) fu_mm_device_attach_qmi_pdc_idle, self);
+        else
+                self->attach_idle = g_idle_add ((GSourceFunc) fu_mm_device_attach_noop_idle, self);
 
 	/* wait for re-probing after uninhibiting */
 	fu_device_set_remove_delay (device, FU_MM_DEVICE_REMOVE_DELAY_REPROBE);
@@ -669,6 +703,8 @@ static void
 fu_mm_device_finalize (GObject *object)
 {
 	FuMmDevice *self = FU_MM_DEVICE (object);
+        if (self->attach_idle)
+                g_source_remove (self->attach_idle);
         g_clear_pointer (&self->qmi_pdc_active_id, g_array_unref);
 	g_object_unref (self->manager);
 	if (self->omodem != NULL)
@@ -691,6 +727,12 @@ fu_mm_device_class_init (FuMmDeviceClass *klass)
 	klass_device->detach = fu_mm_device_detach;
 	klass_device->write_firmware = fu_mm_device_write_firmware;
 	klass_device->attach = fu_mm_device_attach;
+
+	signals [SIGNAL_ATTACH_FINISHED] =
+		g_signal_new ("attach-finished",
+			      G_TYPE_FROM_CLASS (object_class), G_SIGNAL_RUN_LAST,
+			      0, NULL, NULL, g_cclosure_marshal_VOID__VOID,
+			      G_TYPE_NONE, 0);
 }
 
 FuMmDevice *
