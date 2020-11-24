@@ -10,6 +10,8 @@ shared_module('fu_plugin_modem_manager',
     'fu-plugin-modem-manager.c',
     'fu-mm-device.c',
     'fu-qmi-pdc-updater.c',
+    'fu-mhi-bhi-updater.c',
+    'fu-firehose-updater.c',
     'fu-mm-utils.c'
   ],
   include_directories : [
