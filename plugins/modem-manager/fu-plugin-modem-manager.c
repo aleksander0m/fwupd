@@ -184,7 +184,7 @@ fu_plugin_mm_udev_uevent_cb (GUdevClient	*udev,
 static gboolean
 fu_plugin_mm_inhibit_device (FuPlugin *plugin, FuDevice *device, GError **error)
 {
-	static const gchar *subsystems[] = { "tty", "usbmisc", NULL };
+	static const gchar *subsystems[] = { "tty", "usbmisc", "mhi_uci_q", NULL };
 	FuPluginData *priv = fu_plugin_get_data (plugin);
 	g_autoptr(FuPluginMmInhibitedDeviceInfo) info = NULL;
 
