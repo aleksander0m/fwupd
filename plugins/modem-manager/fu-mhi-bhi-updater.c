@@ -8,6 +8,7 @@
 #include "config.h"
 
 #include <string.h>
+#include <errno.h>
 
 #ifdef HAVE_IOCTL_H
 #include <sys/ioctl.h>
